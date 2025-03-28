@@ -1,0 +1,428 @@
+# Code Suite Steps in AWS
+
+## Build Spec
+
+Create a `buildspec-build.yml`
+
+```yaml
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      docker: 20
+    commands:
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2 &
+      - timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
+      - echo Installing dependencies...
+      - node --version
+      - npm --version
+      - npm install
+
+  build:
+    commands:
+      - echo Building the application...
+      - npm run build
+      - npm run build:cdk
+      - docker pull node:20
+      - echo Build completed on `date`
+
+artifacts:
+  files:
+    - '**/*'
+  base-directory: '.'
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+```
+
+## Test Spec
+
+Create a `buildspec-test.yml`
+
+```yaml
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - npm install
+
+  test:
+    commands:
+      - echo Running tests...
+      - npm run test:ci
+      - npm run test:coverage
+    finally:
+      - |
+        if [ $CODEBUILD_BUILD_SUCCEEDING = 1 ]; then
+          echo "Tests completed successfully"
+        else
+          echo "Tests failed"
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - echo Post-test phase...
+      - npm run lint
+      - aws s3 cp coverage/lcov-report/ s3://${COVERAGE_BUCKET_NAME}/coverage/${CODEBUILD_BUILD_NUMBER}/ --recursive || true
+
+artifacts:
+  files:
+    - '**/*'
+  secondary-artifacts:
+    coverage:
+      files:
+        - '**/*'
+      base-directory: 'coverage'
+      name: test-coverage
+
+reports:
+  jest_reports:
+    files:
+      - 'junit.xml'
+    file-format: JUNITXML
+  coverage_reports:
+    files:
+      - 'coverage/clover.xml'
+    file-format: CLOVER
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+```
+
+## Deploy Spec
+
+Create a `buildspec-deploy.yml`
+
+```yaml
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      docker: 20
+    commands:
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2 &
+      - timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
+      - echo Installing dependencies...
+      - node --version
+      - npm --version
+      - npm install
+
+  pre_build:
+    commands:
+      - echo Starting deployment preparation...
+      - cdk --version
+
+  deploy:
+    commands:
+      - echo Starting deployment...
+      - cdk synth
+      - |
+        if [ "$DEPLOY_ENV" = "prod" ]; then
+          echo "Deploying to production..."
+          cdk deploy --require-approval never --all --context environment=prod
+        elif [ "$DEPLOY_ENV" = "staging" ]; then
+          echo "Deploying to staging..."
+          cdk deploy --require-approval never --all --context environment=staging
+        else
+          echo "Deploying to development..."
+          cdk deploy --require-approval never --all --context environment=dev
+        fi
+
+artifacts:
+  files:
+    - cdk.out/**/*
+  base-directory: '.'
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+```
+
+## CodePipeline Spec
+
+Create `pipeline.yaml`
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CodePipeline with Build, Test, and Deploy stages'
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: CodeCommit repository name
+  BranchName:
+    Type: String
+    Description: Branch name
+    Default: main
+  EnvironmentType:
+    Type: String
+    Description: Environment type (dev/staging/prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: NODE_ENV
+            Value: !Ref EnvironmentType
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-build.yml
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+          - LOCAL_SOURCE_CACHE
+
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-test
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: NODE_ENV
+            Value: !Ref EnvironmentType
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-test.yml
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+          - LOCAL_SOURCE_CACHE
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-deploy
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOY_ENV
+            Value: !Ref EnvironmentType
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-deploy.yml
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_CUSTOM_CACHE
+          - LOCAL_SOURCE_CACHE
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        - Name: Test
+          Actions:
+            - Name: Test
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: TestOutput
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref DeployProject
+              InputArtifacts:
+                - Name: TestOutput
+              RunOrder: 1
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: CodeBuildServiceRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:*
+                  - lambda:*
+                  - apigateway:*
+                  - s3:*
+                  - ecr:*
+                Resource: '*'
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodePipelineFullAccess
+      Policies:
+        - PolicyName: CodePipelineServiceRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - codecommit:*
+                  - codebuild:*
+                Resource: '*'
+
+Outputs:
+  PipelineURL:
+    Description: CodePipeline URL
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+  ArtifactBucketName:
+    Description: S3 Bucket for artifacts
+    Value: !Ref ArtifactBucket
+```
+
+Deploy the stack
+
+```shell
+aws cloudformation create-stack \
+  --stack-name my-pipeline-stack \
+  --template-body file://pipeline.yaml \
+  --parameters \
+    ParameterKey=RepositoryName,ParameterValue=my-repo \
+    ParameterKey=BranchName,ParameterValue=main \
+    ParameterKey=EnvironmentType,ParameterValue=dev \
+  --capabilities CAPABILITY_IAM
+```
+
+## Summary of the steps
+
+### This template
+
+* Creates all necessary resources (Pipeline, CodeBuild projects, IAM roles, S3 bucket)
+* Configures three stages in sequence (Build → Test → Deploy)
+* Sets up proper IAM roles and permissions
+* Includes artifact handling between stages
+* Configures environment variables
+* Enables Docker support in build stage
+* Sets up caching for faster builds
+
+### Key features
+
+* Parameterized repository and branch names
+* Environment type selection (dev/staging/prod)
+* Proper IAM roles and permissions
+* S3 artifact bucket with versioning
+* Local caching for CodeBuild projects
+
+### Remember to
+
+* Have the `buildspec` files in your repository
+* Adjust the IAM permissions based on your needs
+* Modify the compute resources if needed
+* Add any additional environment variables required
+* Ensure your repository exists in CodeCommit
